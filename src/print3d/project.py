@@ -1,8 +1,15 @@
-"""Inspect a sliced Bambu .gcode.3mf project."""
+"""Inspect a sliced .gcode.3mf project, from Bambu Studio or ElegooSlicer.
+
+The two slicers are the same code base and write the same layout: a
+`Metadata/plate_N.gcode` per plate, an md5 beside it, a `slice_info.config` and a
+`plate_N.json`. ElegooSlicer keeps its time estimate in the config rather than the
+gcode header, and never writes the plate PNG its GPU thumbnail would need.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import zipfile
 from dataclasses import asdict, dataclass
@@ -84,6 +91,18 @@ def _parse_gcode_stats(gcode: str) -> dict[str, Any]:
     }
 
 
+def _plate_metadata(root: ET.Element) -> list[dict[str, str | None]]:
+    """Each plate's own `key -> value` metadata, in document order."""
+    return [
+        {
+            item.attrib["key"]: item.attrib.get("value")
+            for item in plate.findall("metadata")
+            if "key" in item.attrib
+        }
+        for plate in root.findall("plate")
+    ]
+
+
 def _parse_slice_info(slice_info: str | None) -> dict[str, Any]:
     if not slice_info:
         return {}
@@ -101,16 +120,12 @@ def _parse_slice_info(slice_info: str | None) -> dict[str, Any]:
     for filament in root.findall(".//filament"):
         filaments.append(dict(filament.attrib))
     plates = []
-    for plate in root.findall("plate"):
-        plate_meta = {
-            item.attrib["key"]: item.attrib.get("value")
-            for item in plate.findall("metadata")
-            if "key" in item.attrib
-        }
+    for plate, plate_meta in zip(root.findall("plate"), _plate_metadata(root)):
+        weight = plate_meta.get("weight")
         plates.append(
             {
                 "index": int(plate_meta.get("index") or len(plates) + 1),
-                "weight_g": float(plate_meta["weight"]) if plate_meta.get("weight") else None,
+                "weight_g": float(weight) if weight else None,
                 "filaments": [dict(f.attrib) for f in plate.findall("filament")],
             }
         )
@@ -193,3 +208,47 @@ def read_plate_gcode(path: Path, plate: int = 1) -> str:
         if member not in archive.namelist():
             raise ProjectError(f"{path} has no {member}.")
         return archive.read(member).decode("utf-8", "replace")
+
+
+def _read_member(path: Path, member: str) -> str | None:
+    """One text member of the zip, or None when it is absent or unreadable."""
+    try:
+        with zipfile.ZipFile(path.expanduser().resolve()) as archive:
+            if member not in archive.namelist():
+                return None
+            return archive.read(member).decode("utf-8", "replace")
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def prediction_seconds(path: Path, plate: int = 1) -> int | None:
+    """This slicer's time estimate for one plate, in seconds, or None.
+
+    Bambu Studio writes the time into the gcode header; ElegooSlicer leaves it in
+    `Metadata/slice_info.config` as `<metadata key="prediction" value="637"/>`.
+    """
+    text = _read_member(path, "Metadata/slice_info.config")
+    if not text:
+        return None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    for position, meta in enumerate(_plate_metadata(root)):
+        if int(meta.get("index") or position + 1) != plate:
+            continue
+        value = meta.get("prediction")
+        return int(value) if value and value.isdigit() else None
+    return None
+
+
+def read_plate_json(path: Path, plate: int = 1) -> dict[str, Any] | None:
+    """The slicer's own plate summary: object bounding boxes and filament colours."""
+    text = _read_member(path, f"Metadata/plate_{plate}.json")
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None

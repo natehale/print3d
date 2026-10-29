@@ -6,8 +6,11 @@ from print3d.printability import (
     BED_CHAMFER_MM,
     advise,
     analyze_mesh,
+    analyze_slice,
     worst_severity,
 )
+
+FIXTURE = Path(__file__).parent / "fixtures" / "cube_20mm.gcode.3mf"
 
 
 def _write_stl(path: Path, triangles) -> Path:
@@ -120,3 +123,63 @@ def test_layer_jump_needs_the_mesh_to_agree():
         slice_,
     )
     assert "layer_jump" in {n.code for n in overhanging}
+
+
+# ElegooSlicer writes its config block below the toolpath; Bambu Studio writes it
+# above. Both must yield the toolpath, and the weight either way.
+ELEGOO_GCODE = """\
+; HEADER_BLOCK_START
+; total layer number: 3
+; HEADER_BLOCK_END
+; EXECUTABLE_BLOCK_START
+M83
+G1 Z0.2
+G1 X10 Y10 E0.5
+G1 X12 Y10 E0.4
+G1 Z0.4
+G1 X10 Y10 E0.6
+G1 Z0.6
+G1 X10 Y10 E0.7
+; EXECUTABLE_BLOCK_END
+; CONFIG_BLOCK_START
+; total filament used [g] = 2.10
+; CONFIG_BLOCK_END
+"""
+
+
+def _sliced(tmp_path, gcode: str, name: str = "plate.gcode.3mf"):
+    import zipfile
+
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("Metadata/plate_1.gcode", gcode)
+    return path
+
+
+def test_toolpath_below_the_config_block_is_read(tmp_path):
+    """The layer analysis is per-move, so finding the body is what makes it work."""
+    metrics = analyze_slice(_sliced(tmp_path, ELEGOO_GCODE), 1)
+    assert metrics["printed_layers"] == 3
+    assert metrics["max_z_mm"] == 0.6
+    assert metrics["filament_g"] == 2.1
+    assert metrics["layer_count"] == 3
+
+
+def test_moves_without_a_space_still_count(tmp_path):
+    """`G1X10Y10E0.5` is a move; `G10` is not."""
+    gcode = ELEGOO_GCODE.replace("G1 Z", "G1 Z").replace("G1 X10 Y10 E0.5", "G1X10Y10E0.5")
+    metrics = analyze_slice(_sliced(tmp_path, gcode), 1)
+    assert metrics["printed_layers"] == 3
+    assert metrics["total_extruded_mm"] == 2.2
+
+
+def test_bambu_fixture_layer_analysis_is_unchanged():
+    """A guard on the numbers the X2D reports, so the split cannot drift."""
+    metrics = analyze_slice(FIXTURE, 1)
+    assert metrics["printed_layers"] == 100
+    assert metrics["layer_count"] == 100
+    assert metrics["max_z_mm"] == 20.0
+    assert metrics["estimated_time"] == "13m 52s"
+    assert metrics["filament_g"] == 3.63
+    assert round(metrics["total_extruded_mm"], 3) == 1196.176
+    assert round(metrics["max_layer_growth"], 6) == 3.823330

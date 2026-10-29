@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from print3d.dfm import DfmReport, read_stl
-from print3d.project import read_plate_gcode
+from print3d.project import prediction_seconds, read_plate_gcode
 
 # Slope measured from the horizontal plane: 0 deg is a flat ceiling, 90 deg a
 # vertical wall. The classic 45 deg rule is the default.
@@ -38,10 +38,11 @@ THIN_PART_MM = 1.2
 LONG_PRINT_MIN = 240
 LAYER_GROWTH_WARN = 2.0
 
-MOVE_RE = re.compile(r"^G[0-3]\b(.*)$")
+MOVE_RE = re.compile(r"^G[0-3](?![0-9])(.*)$")
 AXIS_RE = re.compile(r"([XYZEF])(-?\d*\.?\d+)")
 TIME_RE = re.compile(r"total estimated time:\s*(.+?)\s*$", re.IGNORECASE)
-WEIGHT_RE = re.compile(r"total filament weight \[g\]\s*[:=]\s*([0-9.]+)", re.IGNORECASE)
+# Bambu Studio writes `total filament weight [g]`, ElegooSlicer `total filament used [g]`.
+WEIGHT_RE = re.compile(r"total filament (?:weight|used) \[g\]\s*[:=]\s*([0-9.]+)", re.IGNORECASE)
 LAYERS_RE = re.compile(r"total layer number:\s*(\d+)", re.IGNORECASE)
 
 
@@ -140,10 +141,27 @@ def analyze_mesh(path: Path, *, slope_deg: float = OVERHANG_SLOPE_DEG) -> dict[s
     }
 
 
+def _split_toolpath(gcode: str) -> tuple[str, str]:
+    """Everything that is not toolpath, and the toolpath itself.
+
+    Bambu Studio writes its config block above the toolpath and ElegooSlicer
+    writes it below, so one split on the config block hands back the wrong half
+    for one of them. The executable-block markers say where the toolpath really
+    is; the config block stays on the header side either way, because both
+    slicers record the plate's weight there.
+    """
+    if "EXECUTABLE_BLOCK_START" not in gcode:
+        header, _, body = gcode.partition("CONFIG_BLOCK_END")
+        return header, body
+    before, _, rest = gcode.partition("EXECUTABLE_BLOCK_START")
+    body, _, after = rest.partition("EXECUTABLE_BLOCK_END")
+    return before + after, body
+
+
 def analyze_slice(project: Path, plate: int = 1) -> dict[str, Any]:
     """Per-layer material from the gcode. No feature comments needed."""
     gcode = read_plate_gcode(project, plate)
-    header, _, body = gcode.partition("CONFIG_BLOCK_END")
+    header, body = _split_toolpath(gcode)
 
     estimated_time = None
     weight_g = None
@@ -155,6 +173,11 @@ def analyze_slice(project: Path, plate: int = 1) -> dict[str, Any]:
             weight_g = float(match.group(1))
         if match := LAYERS_RE.search(line):
             layer_count = int(match.group(1))
+
+    # ElegooSlicer's gcode header carries no time line, so fall back to the
+    # `prediction` (whole seconds) its slice_info.config records for the plate.
+    if estimated_time is None and (seconds := prediction_seconds(project, plate)):
+        estimated_time = _duration(seconds)
 
     # Z-hops and travel moves revisit a height many times, so bin extrusion by Z
     # rather than starting a layer on every Z change.
@@ -221,6 +244,19 @@ def _minutes(estimate: str | None) -> float | None:
     for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", estimate):
         total += float(value) * {"h": 60.0, "m": 1.0, "s": 1 / 60.0}[unit]
     return round(total, 1) if total else None
+
+
+def _duration(seconds: float) -> str:
+    """Seconds as the `Xm Ys` shape `_minutes()` parses back."""
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
 
 
 def corroborates_layer_jump(mesh: dict[str, Any]) -> bool:
