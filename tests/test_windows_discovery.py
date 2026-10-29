@@ -3,12 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from print3d import blender, studio, windows
+from print3d import blender, studio, targets, windows
 
 
 @pytest.fixture
 def windows_env(tmp_path, monkeypatch):
     monkeypatch.setattr(windows, "sys", SimpleNamespace(platform="win32"))
+    # Discovery runs through targets for the slicer, so its platform check needs the same stub.
+    monkeypatch.setattr(targets, "sys", SimpleNamespace(platform="win32"))
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)",
                  "BLENDER_BIN", "BAMBU_STUDIO_BIN"):
         monkeypatch.delenv(name, raising=False)
@@ -92,6 +94,7 @@ def test_does_not_search_windows_locations_on_other_platforms(
 ):
     executable(windows_env / relative)
     monkeypatch.setattr(windows, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(targets, "sys", SimpleNamespace(platform="linux"))
     # Exclude actual macOS programs on the machine running the test.
     monkeypatch.setattr(Path, "is_file", lambda path: path.is_relative_to(windows_env))
     with pytest.raises(error, match=env):

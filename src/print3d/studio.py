@@ -1,21 +1,19 @@
-"""Bambu Studio CLI wrapper. Isolated --datadir, dry-run first."""
+"""Slicer CLI wrapper (Bambu Studio, ElegooSlicer). Isolated --datadir, dry-run first."""
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 from dataclasses import dataclass
-from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from print3d import targets
 from print3d.repair_3mf import repair_bambu_3mf
-from print3d.windows import studio_locations
+from print3d.targets import Target, TargetError
 
 
 class StudioError(RuntimeError):
-    """Raised for Studio discovery or slice failures."""
+    """Raised for slicer discovery or slice failures."""
 
 
 @dataclass(frozen=True)
@@ -32,35 +30,30 @@ class SliceRequest:
     orient: bool = True
     arrange: bool = True
     ensure_on_bed: bool = True
-    bed_type: str = "Textured PEI Plate"
+    #: A plate name or an alias; None means the target's own default plate.
+    bed_type: str | None = None
     debug_level: int = 2
     # Several parts: Studio reads the meshes, filaments and plates from this
     # file instead of from input_mesh.
     assemble_list: Path | None = None
 
 
+def find_slicer(target: Target, search_path: str | None = None) -> Path:
+    """The slicer CLI for `target`; search order is targets.find_slicer's."""
+    try:
+        return targets.find_slicer(target, search_path)
+    except TargetError as exc:
+        raise StudioError(str(exc)) from exc
+
+
 def find_studio(search_path: str | None = None) -> Path:
-    env = os.environ.get("BAMBU_STUDIO_BIN", "").strip()
-    candidates: list[str | Path] = []
-    if env:
-        candidates.append(env)
-    which = shutil.which("bambu-studio", path=search_path)
-    if which:
-        candidates.append(which)
-    candidates.extend(
-        [
-            "/opt/homebrew/bin/bambu-studio",
-            "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio",
-        ]
-    )
-    for candidate in chain(candidates, studio_locations()):
-        path = Path(candidate).expanduser()
-        if path.is_file():
-            return path.resolve()
-    raise StudioError("Bambu Studio CLI not found. Install Bambu Studio or set BAMBU_STUDIO_BIN.")
+    """Bambu Studio, for the callers that predate targets."""
+    return find_slicer(targets.load("x2d"), search_path)
 
 
-def _common_prefix(studio: Path, request: SliceRequest) -> list[str]:
+def _common_prefix(studio: Path, request: SliceRequest, *, target: Target | None = None) -> list[str]:
+    target = target or targets.active()
+    plate = target.resolve_bed_type(request.bed_type)
     filaments = ";".join(str(path.resolve()) for path in request.filaments)
     settings = f"{request.machine.resolve()};{request.process.resolve()}"
     command = [
@@ -86,7 +79,7 @@ def _common_prefix(studio: Path, request: SliceRequest) -> list[str]:
             "--load-filaments",
             filaments,
             "--curr-bed-type",
-            request.bed_type,
+            plate,
             "--outputdir",
             str(request.output_dir.resolve()),
         ]
@@ -134,16 +127,24 @@ def project_3mf_path(request: SliceRequest) -> Path:
     return request.output_dir / (request.output_3mf.name.replace(".gcode.3mf", ".3mf"))
 
 
-def build_project_command(studio: Path, request: SliceRequest) -> list[str]:
+def build_project_command(
+    studio: Path, request: SliceRequest, *, target: Target | None = None
+) -> list[str]:
     """Export an unsliced Studio project. File > Open this in the Prepare tab."""
-    command = _common_prefix(studio, request)
+    command = _common_prefix(studio, request, target=target)
     command.extend(["--export-3mf", project_3mf_path(request).name])
     command.extend(_models(request))
     return command
 
 
-def build_slice_command(studio: Path, request: SliceRequest, *, input_path: Path | None = None) -> list[str]:
-    command = _common_prefix(studio, request)
+def build_slice_command(
+    studio: Path,
+    request: SliceRequest,
+    *,
+    input_path: Path | None = None,
+    target: Target | None = None,
+) -> list[str]:
+    command = _common_prefix(studio, request, target=target)
     command.extend(
         [
             "--slice",
@@ -156,7 +157,7 @@ def build_slice_command(studio: Path, request: SliceRequest, *, input_path: Path
     return command
 
 
-def _request_dict(request: SliceRequest) -> dict[str, Any]:
+def _request_dict(request: SliceRequest, plate: str) -> dict[str, Any]:
     return {
         "input_mesh": str(request.input_mesh),
         "output_3mf": str(request.output_3mf),
@@ -167,28 +168,35 @@ def _request_dict(request: SliceRequest) -> dict[str, Any]:
         "datadir": str(request.datadir),
         "output_dir": str(request.output_dir),
         "slice_plate": request.slice_plate,
-        "bed_type": request.bed_type,
+        "bed_type": plate,
         "assemble_list": str(request.assemble_list) if request.assemble_list else None,
     }
 
 
-def slice_plan(request: SliceRequest, *, studio: Path | None = None) -> dict[str, Any]:
+def slice_plan(
+    request: SliceRequest, *, studio: Path | None = None, target: Target | None = None
+) -> dict[str, Any]:
+    target = target or targets.active()
     binary = studio
     if binary is None:
         # A plan is only a preview; name the binary even when it is not installed.
         try:
-            binary = find_studio()
+            binary = find_slicer(target)
         except StudioError:
-            binary = Path("bambu-studio")
+            binary = Path(target.slicer_command)
+    plate = target.resolve_bed_type(request.bed_type)
     return {
         "dry_run": True,
         "studio": str(binary),
-        "project_command": build_project_command(binary, request),
-        "command": build_slice_command(binary, request),
-        "request": _request_dict(request),
+        "project_command": build_project_command(binary, request, target=target),
+        "command": build_slice_command(binary, request, target=target),
+        "request": _request_dict(request, plate),
         "open_in_studio": str(project_3mf_path(request)),
-        "note": "Open the .3mf (not .gcode.3mf) in Bambu Studio File > Open. "
-        ".gcode.3mf is a sliced print job and the Prepare tab reports no geometry.",
+        "note": (
+            f"Open the .3mf (not .gcode.3mf) in {target.slicer} File > Open. "
+            ".gcode.3mf is a sliced print job and the Prepare tab reports no geometry."
+        ),
+        "target": target.as_dict(),
     }
 
 
@@ -196,14 +204,16 @@ def _run(command: list[str], timeout_s: float) -> subprocess.CompletedProcess[st
     return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout_s)
 
 
-def _require_file(path: Path, result: subprocess.CompletedProcess[str], label: str) -> None:
+def _require_file(
+    path: Path, result: subprocess.CompletedProcess[str], label: str, target: Target
+) -> None:
     if result.returncode != 0:
         raise StudioError(
-            f"Bambu Studio {label} failed with exit {result.returncode}.\n"
+            f"{target.slicer} {label} failed with exit {result.returncode}.\n"
             f"stderr tail:\n{(result.stderr or result.stdout)[-4000:]}"
         )
     if not path.is_file():
-        raise StudioError(f"Studio {label} exited 0 but did not write {path}")
+        raise StudioError(f"{target.slicer} {label} exited 0 but did not write {path}")
 
 
 def run_slice(
@@ -211,9 +221,11 @@ def run_slice(
     *,
     studio: Path | None = None,
     timeout_s: float = 180,
+    target: Target | None = None,
 ) -> dict[str, Any]:
-    binary = studio or find_studio()
-    plan = slice_plan(request, studio=binary)
+    target = target or targets.active()
+    binary = studio or find_slicer(target)
+    plan = slice_plan(request, studio=binary, target=target)
     plan["dry_run"] = False
     request.datadir.mkdir(parents=True, exist_ok=True)
     request.output_dir.mkdir(parents=True, exist_ok=True)
@@ -221,23 +233,25 @@ def run_slice(
     project = project_3mf_path(request)
     project.parent.mkdir(parents=True, exist_ok=True)
 
-    project_result = _run(build_project_command(binary, request), timeout_s)
+    project_result = _run(build_project_command(binary, request, target=target), timeout_s)
     exported_project = request.output_dir / project.name
-    _require_file(exported_project, project_result, "project export")
+    _require_file(exported_project, project_result, "project export", target)
     if exported_project.resolve() != project.resolve():
         project.write_bytes(exported_project.read_bytes())
-    repair_bambu_3mf(project)
+    if target.repair_3mf:
+        repair_bambu_3mf(project)
 
     # Slice the STL, not the project 3mf. --load-settings on 3mf input has
     # segfaulted Studio CLI (bambulab/BambuStudio#10402).
-    slice_cmd = build_slice_command(binary, request, input_path=request.input_mesh)
+    slice_cmd = build_slice_command(binary, request, input_path=request.input_mesh, target=target)
     plan["command"] = slice_cmd
     slice_result = _run(slice_cmd, timeout_s)
     exported = request.output_dir / request.output_3mf.name
-    _require_file(exported, slice_result, "slice")
+    _require_file(exported, slice_result, "slice", target)
     if exported.resolve() != request.output_3mf.resolve():
         request.output_3mf.write_bytes(exported.read_bytes())
-    repair_bambu_3mf(request.output_3mf)
+    if target.repair_3mf:
+        repair_bambu_3mf(request.output_3mf)
 
     plan["returncode"] = slice_result.returncode
     plan["stdout"] = slice_result.stdout

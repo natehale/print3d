@@ -8,6 +8,9 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
+from print3d import targets
+from print3d.targets import Target
+
 
 def program_files_dirs() -> Iterator[Path]:
     if sys.platform != "win32":
@@ -34,6 +37,14 @@ def blender_locations() -> Iterator[Path]:
         )
 
 
-def studio_locations() -> Iterator[Path]:
+def slicer_locations(target: Target) -> Iterator[Path]:
+    """Where `target`'s slicer installs on Windows, under each program-files root."""
+    if not target.windows_dir:
+        return
     for root in program_files_dirs():
-        yield root / "Bambu Studio" / "bambu-studio.exe"
+        yield root.joinpath(*target.windows_dir)
+
+
+def studio_locations() -> Iterator[Path]:
+    """Bambu Studio's install, for the callers that predate targets."""
+    yield from slicer_locations(targets.active())
