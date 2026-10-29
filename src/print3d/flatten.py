@@ -51,13 +51,21 @@ def load_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def build_name_index(profiles_root: Path, vendor: str = "BBL") -> dict[str, dict[str, Any]]:
+def build_name_index(
+    profiles_root: Path, vendor: str = "BBL", *, nested: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Name -> profile for one vendor.
+
+    `nested` walks the subfolders some vendors sort their profiles into; Elegoo
+    keeps one folder per printer series.
+    """
     index: dict[str, dict[str, Any]] = {}
     for kind in ("machine", "process", "filament"):
         directory = profiles_root / vendor / kind
         if not directory.is_dir():
             continue
-        for path in directory.glob("*.json"):
+        paths = directory.rglob("*.json") if nested else directory.glob("*.json")
+        for path in sorted(paths):
             try:
                 data = load_json(path)
             except (OSError, json.JSONDecodeError, FlattenError):
