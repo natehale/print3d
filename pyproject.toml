@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "print3d"
 version = "0.1.0"
-description = "Idea to a reviewable Bambu Studio project for a Bambu Lab X2D"
+description = "Idea to a reviewable, slicer-ready project for a Bambu Lab X2D or an Elegoo Centauri Carbon 2"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["Pillow>=10.1,<14", "mcp>=2.0,<3"]
@@ -25,7 +25,7 @@ include-package-data = false  # All bundled resources are listed below.
 "print3d.skill" = "skills/print3d"
 
 [tool.setuptools.package-data]
-print3d = ["profiles/*/*", "coupons/*.py"]
+print3d = ["profiles/*/*", "targets/*.json", "coupons/*.py"]
 "print3d.skill" = ["*.md", "references/*.md"]
 
 [tool.uv]
