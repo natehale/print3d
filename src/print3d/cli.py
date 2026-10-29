@@ -11,6 +11,7 @@ from print3d.blender import BlenderError, find_blender, run_model_script
 from print3d.brief import parse_brief
 from print3d import setup as installer
 from print3d import spec as specs
+from print3d import targets
 from print3d.dfm import check_mesh
 from print3d.fits import KINDS, load_fits, save_fits
 from print3d.flatten import flatten_x2d
@@ -21,7 +22,7 @@ from print3d.photo import grid, meet
 from print3d.pipeline import _model_params, run_job
 from print3d.printability import advise, analyze_mesh, analyze_slice, dfm_advice, worst_severity
 from print3d.project import inspect_project
-from print3d.studio import SliceRequest, find_studio, slice_plan
+from print3d.studio import SliceRequest, StudioError, find_slicer, slice_plan
 from print3d.viewer import build_viewer
 
 
@@ -37,6 +38,9 @@ def cmd_make(args: argparse.Namespace) -> int:
         mesh=Path(args.mesh) if args.mesh else None,
         color=args.color,
         execute=not args.dry_run,
+        target=targets.load(args.target) if args.target else None,
+        plate=args.plate,
+        material=args.material,
     )
     _print_json(report)
     return 1 if report.get("severity") == "error" else 0
@@ -225,50 +229,90 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def cmd_flatten(args: argparse.Namespace) -> int:
-    _print_json(flatten_x2d(output_dir=Path(args.output) if args.output else default_profiles_dir()))
+    target = targets.load(args.target) if args.target else targets.active()
+    output = Path(args.output) if args.output else default_profiles_dir(target)
+    _print_json(flatten_x2d(output_dir=output))
+    return 0
+
+
+def cmd_targets(_args: argparse.Namespace) -> int:
+    entries = []
+    for key in targets.available():
+        target = targets.load(key)
+        try:
+            slicer = str(targets.find_slicer(target))
+        except targets.TargetError:
+            slicer = None
+        entries.append(
+            {
+                "key": key,
+                "label": target.label,
+                "slicer": target.slicer,
+                "slicer_found": slicer is not None,
+                "slicer_path": slicer,
+                "description": targets.describe(target),
+            }
+        )
+    _print_json({"active": targets.active_key(), "targets": entries})
     return 0
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
-    profiles = default_profiles_dir()
+    target = targets.active()
     try:
         blender = str(find_blender())
     except BlenderError as exc:
         blender = f"missing: {exc}"
-    _print_json(
-        {
-            "blender": blender,
-            "studio": str(find_studio()),
-            "profiles": str(profiles),
-            "profiles_present": all(
-                (profiles / name).is_file()
-                for name in ("machine.json", "process.json", "filament.json")
-            ),
-            "stops_at": "review in Bambu Studio",
-        }
-    )
+    payload = {
+        "target": target.as_dict(),
+        "blender": blender,
+        "profiles": None,
+        "profiles_present": False,
+        "stops_at": f"review in {target.slicer}",
+    }
+    try:
+        payload["studio"] = str(find_slicer(target))
+    except StudioError as exc:
+        payload["studio"] = f"missing: {exc}"
+    try:
+        profiles = targets.job_profiles(target)
+    except targets.TargetError as exc:
+        payload["profiles_error"] = str(exc)
+    else:
+        payload["profiles"] = str(profiles.machine.parent)
+        payload["profiles_present"] = True
+        payload["slicer_profiles"] = profiles.as_dict()
+    _print_json(payload)
     return 0
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    profiles = default_profiles_dir()
+    # The plan is only worth printing when it names the profiles that exist, so
+    # it resolves them the same way a job does rather than assuming a pinned set.
+    target = targets.active()
+    profiles = targets.job_profiles(target)
     output = Path(args.output)
     request = SliceRequest(
         input_mesh=Path(args.mesh),
         output_3mf=output,
-        machine=profiles / "machine.json",
-        process=profiles / "process.json",
-        filaments=(profiles / "filament.json",),
+        machine=profiles.machine,
+        process=profiles.process,
+        filaments=(profiles.filament,),
         datadir=output.parent / "studio-datadir",
         output_dir=output.parent,
+        bed_type=profiles.bed_type,
     )
-    _print_json(slice_plan(request))
+    _print_json(slice_plan(request, target=target))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="print3d", description="Idea to a reviewable Bambu Studio project for an X2D"
+        prog="print3d",
+        description=(
+            "Idea to a reviewable, slicer-ready project for a Bambu Lab X2D or an "
+            "Elegoo Centauri Carbon 2"
+        ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -277,6 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
     make_cmd.add_argument("--script", help="Blender model script (default: jobs/<slug>/model.py)")
     make_cmd.add_argument("--mesh", help="Skip modelling and use this STL")
     make_cmd.add_argument("--color")
+    make_cmd.add_argument("--target", choices=targets.available(),
+                          help="Machine to slice for (default: $PRINT3D_TARGET, else x2d)")
+    make_cmd.add_argument("--plate", help="Bed type name or alias, e.g. textured or smooth")
+    make_cmd.add_argument("--material", help="Filament material, e.g. PLA Basic or PETG")
     make_cmd.add_argument("--dry-run", action="store_true")
     make_cmd.set_defaults(func=cmd_make)
 
@@ -400,7 +448,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     flatten_cmd = sub.add_parser("flatten", help="Rebuild pinned X2D Studio profiles")
     flatten_cmd.add_argument("--output")
+    flatten_cmd.add_argument("--target", choices=targets.available(),
+                             help="Machine whose pinned profiles to rebuild (default: $PRINT3D_TARGET)")
     flatten_cmd.set_defaults(func=cmd_flatten)
+
+    targets_cmd = sub.add_parser("targets", help="List the machines print3d can slice for")
+    targets_cmd.set_defaults(func=cmd_targets)
 
     status_cmd = sub.add_parser("status", help="Show Blender, slicer and profile paths")
     status_cmd.set_defaults(func=cmd_status)

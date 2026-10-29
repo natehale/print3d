@@ -3,6 +3,10 @@
 The same operations as the CLI. Tools that produce pictures (the coordinate
 grid, the plate preview, the likeness overlays) return them as images, so the
 agent sees them without a separate file read.
+
+It slices for a Bambu Lab X2D through Bambu Studio, or an Elegoo Centauri
+Carbon 2 through ElegooSlicer; the `targets` tool says which machines exist and
+which one a `make` will use.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from print3d import spec as specs
+from print3d import targets as target_layer
 from print3d.dfm import check_mesh
 from print3d.fits import load_fits, save_fits
 from print3d.handoff import build_handoff
@@ -29,10 +34,13 @@ from print3d.viewer import build_viewer
 from print3d.printability import advise, analyze_mesh, analyze_slice, dfm_advice, worst_severity
 
 INSTRUCTIONS = """\
-print3d turns an idea, or a photo of an object, into a Bambu Studio project for a
-Bambu Lab X2D. You write a Blender (bpy) model script; `make` runs it, checks the
-mesh, slices it and returns advice, each note with the fix to apply to the script.
-Iterate until no note is at `error`, then hand the user the .3mf path.
+print3d turns an idea, or a photo of an object, into a slicer project for a Bambu
+Lab X2D (Bambu Studio) or an Elegoo Centauri Carbon 2 (ElegooSlicer). You write
+a Blender (bpy) model script; `make` runs it, checks the mesh, slices it and
+returns advice, each note with the fix to apply to the script. Iterate until no
+note is at `error`, then hand the user the .3mf path. Call `targets` to see the
+machines and which one is active; `make` takes `target`, `plate` and `material`
+to choose per job.
 
 Read guide("workflow") before the first run. From a photo of an object, also read
 guide("from-photo"): it records every dimension with its evidence and adds a
@@ -103,9 +111,14 @@ def make(
     mesh: str | None = None,
     color: str | None = None,
     dry_run: bool = False,
+    target: str | None = None,
+    plate: str | None = None,
+    material: str | None = None,
 ) -> list[Any]:
     """Model, check and slice. With no model yet, writes a starter model.py and names its path.
 
+    `target` picks the machine (see the `targets` tool); `plate` is a bed type or
+    alias and `material` a filament name for that machine.
     Returns the report, then the plate preview and any likeness overlays.
     """
     report = run_job(
@@ -114,10 +127,39 @@ def make(
         mesh=Path(mesh) if mesh else None,
         color=color,
         execute=not dry_run,
+        target=target_layer.load(target) if target else None,
+        plate=plate,
+        material=material,
     )
     overlays = [r["overlay"] for r in report.get("likeness", [])]
     plates = [p["png"] for p in report.get("plates", [])] or [report.get("plate_png")]
     return _with_images(report, [*plates, *overlays])
+
+
+@tool(read_only=True)
+def targets() -> str:
+    """The machines print3d can slice for, each with the slicer it drives, and which one is active.
+
+    Pass a target's key to `make` to slice for it.
+    """
+    entries = []
+    for key in target_layer.available():
+        target = target_layer.load(key)
+        try:
+            slicer = str(target_layer.find_slicer(target))
+        except target_layer.TargetError:
+            slicer = None
+        entries.append(
+            {
+                "key": key,
+                "label": target.label,
+                "slicer": target.slicer,
+                "slicer_found": slicer is not None,
+                "slicer_path": slicer,
+                "description": target_layer.describe(target),
+            }
+        )
+    return _json({"targets": entries, "active": target_layer.active_key()})
 
 
 @tool(images=True)

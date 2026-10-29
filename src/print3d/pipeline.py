@@ -16,13 +16,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+from print3d import targets
 from print3d.blender import BlenderError, run_model_script, scaffold_script
 from print3d.brief import PrintBrief, parse_brief
 from print3d.dfm import check_mesh, require_printable
-from print3d.filaments import DEFAULT_COLOUR, NOZZLES, colour_hex, job_filaments
+from print3d.filaments import DEFAULT_COLOUR, colour_hex, job_filaments
 from print3d.fits import fit_advice, load_fits
 from print3d.likeness import check_likeness, likeness_advice
-from print3d.paths import default_jobs_dir, default_profiles_dir
+from print3d.paths import default_jobs_dir
+from print3d.plate_preview import draw_plate
 from print3d.printability import (
     Advice,
     advise,
@@ -101,19 +103,31 @@ def run_job(
     color: str | None = None,
     execute: bool = True,
     jobs_dir: Path | None = None,
-    profiles_dir: Path | None = None,
+    target: targets.Target | None = None,
+    plate: str | None = None,
+    material: str | None = None,
 ) -> dict[str, Any]:
+    target = target or targets.active()
     brief = parse_brief(prompt, color=color)
     job_dir = (jobs_dir or default_jobs_dir()) / brief.slug
     job_dir.mkdir(parents=True, exist_ok=True)
     # Modelling can overwrite meshes before a failure or a dry-run return.
     # Invalidate the previous slice's report before touching any job artifacts.
-    report: dict[str, Any] = {"brief": brief.as_dict(), "job_dir": str(job_dir), "status": "running"}
+    report: dict[str, Any] = {
+        "brief": brief.as_dict(),
+        "job_dir": str(job_dir),
+        "status": "running",
+        "target": target.as_dict(),
+    }
     _save_report(job_dir, report)
     try:
+        profiles = targets.job_profiles(target, material=material, bed_type=plate)
+        report["slicer_profiles"] = profiles.as_dict()
+        report["material"] = profiles.material
+        report["plate"] = profiles.bed_type
         result = _run_job(
             brief, job_dir, report, script=script, mesh=mesh, execute=execute,
-            profiles=profiles_dir or default_profiles_dir(),
+            target=target, profiles=profiles,
         )
     except Exception as exc:
         report.update(status="failed", error=str(exc))
@@ -131,14 +145,9 @@ def _run_job(
     script: Path | None,
     mesh: Path | None,
     execute: bool,
-    profiles: Path,
+    target: targets.Target,
+    profiles: targets.JobProfiles,
 ) -> dict[str, Any]:
-    for required in ("machine.json", "process.json", "filament.json"):
-        if not (profiles / required).is_file():
-            raise PipelineError(
-                f"Pinned profile missing: {profiles / required}. Run: python -m print3d flatten"
-            )
-
     fits = load_fits()
     spec = load_spec(job_dir)
     if spec["dims"] or spec["unknowns"]:
@@ -167,7 +176,7 @@ def _run_job(
         report["model"]["source"] = "blender"
 
     if report["model"].get("parts"):
-        return _run_parts(brief, job_dir, profiles, spec, fits, mesh_path, report, execute)
+        return _run_parts(brief, job_dir, target, profiles, spec, fits, mesh_path, report, execute)
 
     # 3. Is it even a solid?
     dfm = require_printable(mesh_path)
@@ -183,20 +192,26 @@ def _run_job(
         input_mesh=mesh_path,
         output_3mf=job_dir / "slice" / f"{brief.slug}.gcode.3mf",
         output_project_3mf=job_dir / "slice" / f"{brief.slug}.3mf",
-        machine=profiles / "machine.json",
-        process=profiles / "process.json",
+        machine=profiles.machine,
+        process=profiles.process,
         filaments=(
-            tuple(job_filaments(profiles / "filament.json", [brief.color_name], job_dir / "filaments"))
+            tuple(
+                job_filaments(
+                    profiles.filament, [brief.color_name], job_dir / "filaments",
+                    material=profiles.material, target=target,
+                )
+            )
             if brief.color_name
-            else (profiles / "filament.json",)
+            else (profiles.filament,)
         ),
+        bed_type=profiles.bed_type,
         datadir=job_dir / "studio-datadir",
         output_dir=job_dir / "slice",
         # Auto-orient would silently rotate the part and invalidate every
         # overhang note below. Orientation is the model script's business.
         orient=False,
     )
-    report["slice_plan"] = slice_plan(request)
+    report["slice_plan"] = slice_plan(request, target=target)
 
     if not execute:
         report["status"] = "dry_run"
@@ -206,10 +221,15 @@ def _run_job(
         return report
 
     # 4. Slice, then read back what the slicer actually did.
-    slice_result = run_slice(request)
+    slice_result = run_slice(request, target=target)
     project = Path(slice_result["output_3mf"])
     inspection = inspect_project(project)
-    png = extract_plate_png(project, job_dir / "slice" / f"{brief.slug}_plate.png")
+    plate_png = job_dir / "slice" / f"{brief.slug}_plate.png"
+    png = extract_plate_png(project, plate_png)
+    if png is None:
+        # Neither CLI writes a plate image headless; draw one so the report
+        # still points at a real picture (upstream print3d issue #23).
+        png = draw_plate(project, plate_png, plate=1, build_volume_mm=target.build_volume_mm)
     slice_metrics = analyze_slice(project)
     notes = advise(mesh_metrics, slice_metrics, extra=likeness_notes)
     severity = worst_severity(notes)
@@ -234,7 +254,7 @@ def _run_job(
             "next_step": (
                 "Fix the errors in the model script and run again."
                 if severity == "error"
-                else "Open the .3mf in Bambu Studio, check the preview, and print it from there."
+                else f"Open the .3mf in {target.slicer}, check the preview, and print it from there."
             ),
         }
     )
@@ -260,7 +280,8 @@ def _run_job(
 def _run_parts(
     brief: PrintBrief,
     job_dir: Path,
-    profiles: Path,
+    target: targets.Target,
+    profiles: targets.JobProfiles,
     spec: dict[str, Any],
     fits: dict[str, Any],
     assembly: Path,
@@ -274,14 +295,16 @@ def _run_parts(
     colours: list[str] = []
     for part in parts.values():
         part["color"] = part["color"] or brief.color_name or DEFAULT_COLOUR
-        colour_hex(part["color"])
+        colour_hex(part["color"], target)
         key = part["color"].strip().lower()
         if key not in colours:
             colours.append(key)
         part["filament"] = colours.index(key) + 1
-    filaments = job_filaments(profiles / "filament.json", colours, job_dir / "filaments")
+    filaments = job_filaments(
+        profiles.filament, colours, job_dir / "filaments", material=profiles.material, target=target
+    )
     report["filaments"] = [
-        {"filament": i, "color": c, "hex": colour_hex(c)} for i, c in enumerate(colours, start=1)
+        {"filament": i, "color": c, "hex": colour_hex(c, target)} for i, c in enumerate(colours, start=1)
     ]
 
     # Plates are numbered 1..n for Studio, in the order the script named them.
@@ -313,12 +336,22 @@ def _run_parts(
         )
     if errors:
         raise PipelineError("; ".join(errors))
-    if len(colours) > NOZZLES:
+    if not target.multicolour and len(colours) > 1:
+        notes.append(
+            Advice(
+                "colours",
+                "error",
+                f"{len(colours)} colours, but {target.slicer}'s CLI assigns only one filament per slice "
+                "(verified on ElegooSlicer 1.5.3.5), so the plates would print in a single colour.",
+                f"Slice the plates in {target.slicer}'s GUI to print in colour for now.",
+            )
+        )
+    elif len(colours) > target.nozzles:
         notes.append(
             Advice(
                 "colours",
                 "note",
-                f"{len(colours)} colours on {NOZZLES} nozzles: Studio swaps filament within a nozzle, "
+                f"{len(colours)} colours on {target.nozzles} nozzles: Studio swaps filament within a nozzle, "
                 "purging at every change.",
                 "Fine with an AMS; otherwise keep to two colours per plate.",
             )
@@ -367,22 +400,23 @@ def _run_parts(
         input_mesh=assembly,
         output_3mf=slice_dir / f"{brief.slug}.gcode.3mf",
         output_project_3mf=slice_dir / f"{brief.slug}.3mf",
-        machine=profiles / "machine.json",
-        process=profiles / "process.json",
+        machine=profiles.machine,
+        process=profiles.process,
+        bed_type=profiles.bed_type,
         filaments=tuple(filaments),
         datadir=job_dir / "studio-datadir",
         output_dir=slice_dir,
         orient=False,
         assemble_list=assemble,
     )
-    report["slice_plan"] = slice_plan(request)
+    report["slice_plan"] = slice_plan(request, target=target)
 
     if not execute:
         notes = with_clean(notes)
         report.update(status="dry_run", advice=[n.as_dict() for n in notes], severity=worst_severity(notes))
         return report
 
-    slice_result = run_slice(request)
+    slice_result = run_slice(request, target=target)
     project = Path(slice_result["output_3mf"])
     inspection = inspect_project(project)
     # Per plate, slice_info has every filament; the gcode header weighs only the first.
@@ -398,6 +432,11 @@ def _run_parts(
         on_plate = [metrics[obj["name"]] for obj in model["objects"] if obj["plate"] == index]
         notes.extend(slice_advice(metrics_, any(corroborates_layer_jump(m) for m in on_plate)))
         png = extract_plate_png(project, slice_dir / f"{brief.slug}_plate_{index}.png", plate=index)
+        if png is None:
+            png = draw_plate(
+                project, slice_dir / f"{brief.slug}_plate_{index}.png",
+                plate=index, build_volume_mm=target.build_volume_mm,
+            )
         plates.append(
             {
                 "plate": index,
@@ -438,7 +477,7 @@ def _run_parts(
             "next_step": (
                 "Fix the errors in the model script and run again."
                 if severity == "error"
-                else "Open the .3mf in Bambu Studio, check each plate, and print from there."
+                else f"Open the .3mf in {target.slicer}, check each plate, and print from there."
             ),
         }
     )

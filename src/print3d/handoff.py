@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from print3d import targets
 from print3d.blender import BlenderError
 from print3d.filaments import DEFAULT_COLOUR, colour_hex
 from print3d.fits import load_fits
@@ -81,9 +82,46 @@ def _parts(report: dict[str, Any], slug: str) -> list[dict[str, Any]]:
     ]
 
 
-def _cost_per_kg() -> float:
-    profile = json.loads((default_profiles_dir() / "filament.json").read_text(encoding="utf-8"))
-    return float(profile["filament_cost"][0])
+def _filament_path(report: dict[str, Any], target: targets.Target) -> Path | None:
+    """The filament profile the job sliced with, else the target's pinned one."""
+    filament = (report.get("slicer_profiles") or {}).get("filament")
+    path = Path(filament) if filament else None
+    if path is not None and path.is_file():
+        return path
+    try:
+        pinned = default_profiles_dir(target) / "filament.json"
+    except targets.TargetError:
+        return None
+    return pinned if pinned.is_file() else None
+
+
+def _cost_per_kg(report: dict[str, Any], target: targets.Target) -> float | None:
+    """The spool price, from the filament profile the job actually sliced with."""
+    path = _filament_path(report, target)
+    if path is None:
+        return None
+    costs = json.loads(path.read_text(encoding="utf-8")).get("filament_cost") or []
+    return float(costs[0]) if costs else None
+
+
+def _material_label(report: dict[str, Any], target: targets.Target) -> str:
+    """The filament's display name: the profile's own, minus the machine suffix."""
+    path = _filament_path(report, target)
+    if path is not None:
+        name = json.loads(path.read_text(encoding="utf-8")).get("name")
+        if name:
+            return str(name).split("@")[0].strip()
+    return report.get("material") or target.default_material
+
+
+def _machine_line(report: dict[str, Any], target: targets.Target) -> str:
+    """The line under the title: the machine, then what it prints with."""
+    plate = target.bed_type.removesuffix(" Plate")
+    plate = plate[:1].lower() + plate[1:]
+    return (
+        f"{target.label}, {target.nozzle_mm:g} mm nozzle, {target.layer_height:.2f} mm layers, "
+        f"{_material_label(report, target)}, {plate}, supports {'off' if target.supports_off else 'on'}"
+    )
 
 
 def _table(head: list[str], rows: list[list[str]]) -> str:
@@ -92,8 +130,8 @@ def _table(head: list[str], rows: list[list[str]]) -> str:
     return f'<div class="wrap"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def _swatch(colour: str) -> str:
-    return f'<span class="swatch" style="background:{colour_hex(colour)}"></span>{_esc(colour)}'
+def _swatch(colour: str, target: targets.Target) -> str:
+    return f'<span class="swatch" style="background:{colour_hex(colour, target)}"></span>{_esc(colour)}'
 
 
 def _section(title: str, body: str) -> str:
@@ -120,13 +158,15 @@ def _files(report: dict[str, Any], parts: list[dict[str, Any]], job_dir: Path, o
     return files
 
 
-def _renders(parts: list[dict[str, Any]], job_dir: Path, out: Path) -> tuple[dict[str, Path], str]:
+def _renders(
+    parts: list[dict[str, Any]], job_dir: Path, out: Path, target: targets.Target
+) -> tuple[dict[str, Path], str]:
     items = []
     for part in parts:
         stl = job_dir / "mesh" / "assembly" / f"{part['name']}.stl"
         if not stl.is_file():
             stl = out / "stl" / f"{part['name']}.stl"
-        items.append({"stl": str(stl), "hex": colour_hex(part["color"]), "group": part["object"]})
+        items.append({"stl": str(stl), "hex": colour_hex(part["color"], target), "group": part["object"]})
     renders: dict[str, Path] = {}
     try:
         renders["assembled"] = render_parts(items, out / "assembled.png")
@@ -149,6 +189,8 @@ def build_handoff(
             f"The last run of {job_dir.name} is {report.get('status', 'incomplete')}; "
             "complete `print3d make` without --dry-run before handing it off."
         )
+    key = (report.get("target") or {}).get("key")
+    target = targets.load(key) if key else targets.active()
     slug = job_dir.name
     spec = load_spec(job_dir)
     parts = _parts(report, slug)
@@ -158,13 +200,13 @@ def build_handoff(
     (out / "stl").mkdir(parents=True)
 
     files = _files(report, parts, job_dir, out)
-    renders, render_note = _renders(parts, job_dir, out) if render else ({}, "")
+    renders, render_note = _renders(parts, job_dir, out, target) if render else ({}, "")
     files.extend(path.name for path in renders.values())
 
     metrics = report.get("slice_metrics", {})
     grams = metrics.get("filament_g")
-    per_kg = cost_per_kg if cost_per_kg is not None else _cost_per_kg()
-    cost = grams * per_kg / 1000.0 if grams is not None else None
+    per_kg = cost_per_kg if cost_per_kg is not None else _cost_per_kg(report, target)
+    cost = grams * per_kg / 1000.0 if (grams is not None and per_kg is not None) else None
     money = (lambda v: f"{v:.2f} {_esc(currency)}".strip())
     listing = report.get("listing") or spec.get("listing")
     plates = report.get("plates") or [
@@ -193,7 +235,7 @@ def build_handoff(
         [
             f"<b>{_esc(p['name'])}</b>"
             + (f'<div class="sub">prints fused into {_esc(p["object"])}</div>' if p["object"] != p["name"] else ""),
-            _swatch(p["color"]),
+            _swatch(p["color"], target),
             _size(p["print_size_mm"]),
             str(p["plate"]),
             ", ".join(f"{_esc(k)} = {_esc(v)}" for k, v in (p.get("settings") or {}).items()) or "–",
@@ -246,7 +288,7 @@ def build_handoff(
         if a["severity"] in ("error", "warn")
     )
     plate_cards = "".join(
-        f'<figure>{_img(p.get("png"), f"plate {p["plate"]}")}<figcaption>Plate {p["plate"]} · '
+        f'<figure>{_img(p.get("png"), "plate " + str(p["plate"]))}<figcaption>Plate {p["plate"]} · '
         f'{_minutes(p.get("estimated_minutes"))} · {(p.get("filament_g") or 0):.1f} g · '
         f'{p.get("layer_count") or "–"} layers</figcaption></figure>'
         for p in plates
@@ -315,8 +357,7 @@ footer {{ margin-top:32px; color:var(--muted); font-size:12px; border-top:1px so
 <header>
   <div>
     <h1>{_esc(report["brief"]["prompt"])}</h1>
-    <p class="sub">{_esc(slug)} · {time.strftime("%Y-%m-%d")} · Bambu Lab X2D, 0.4 mm nozzle, 0.20 mm layers,
-    Bambu PLA Basic, textured PEI, supports off</p>
+    <p class="sub">{_esc(slug)} · {time.strftime("%Y-%m-%d")} · {_esc(_machine_line(report, target))}</p>
     {replaces}
   </div>
   <span class="badge">{'Ready to print' if ready else 'Needs work'}</span>
@@ -332,7 +373,7 @@ footer {{ margin-top:32px; color:var(--muted); font-size:12px; border-top:1px so
 {_section("Open notes", f"<ul>{notes}</ul>" if notes else "")}
 {_section("Plates", f'<div class="plates">{plate_cards}</div>')}
 {_section("Files", f"<ul>{file_list}</ul>")}
-<p class="sub">Open the <code>.3mf</code> in Bambu Studio to review and print. Each STL is one part in its print pose.</p>
+<p class="sub">Open the <code>.3mf</code> in {_esc(target.slicer)} to review and print. Each STL is one part in its print pose.</p>
 <footer>Made with print3d. Nothing here was sent to a printer.</footer>
 </main></body></html>
 """

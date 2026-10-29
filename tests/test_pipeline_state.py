@@ -43,7 +43,7 @@ def job(tmp_path, monkeypatch, request):
             )
         return result
 
-    def slice_(request):
+    def slice_(request, **_kwargs):
         if state["failure"] == "slice":
             raise StudioError("slice failed")
         request.output_dir.mkdir(parents=True, exist_ok=True)
