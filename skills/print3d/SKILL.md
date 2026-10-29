@@ -1,11 +1,11 @@
 ---
 name: print3d
-description: Model a part in Blender from an idea, a photo of an object, or the shop listing of something you would otherwise buy, slice it for the Bambu X2D, and iterate until it prints clean and matches the photo.
+description: Model a part in Blender from an idea, a photo of an object, or the shop listing of something you would otherwise buy, slice it for a Bambu X2D or an Elegoo Centauri Carbon 2, and iterate until it prints clean and matches the photo.
 argument-hint: "[what to make, a photo of the object, or a shop link]"
 disable-model-invocation: true
 ---
 
-# /print3d — idea to a printable X2D part
+# /print3d — idea to a printable part (Bambu X2D or Elegoo Centauri Carbon 2)
 
 `print3d` below is the print3d command line. When you have the print3d MCP
 tools, use those of the same names instead: they return the plate preview and
@@ -134,7 +134,27 @@ and the print sheet.
 
 ## The machine
 
-X2D, 0.4 mm nozzle, 256 × 256 × 260 mm bed, 0.20 mm layers, Bambu PLA Basic,
-textured PEI plate. **The pinned process has supports off** — that is why an
-overhang note is a real defect and not a setting to flip. Two nozzles: two
-colours print without a filament change.
+Two machines, selected with `PRINT3D_TARGET` (`x2d` by default, so an install that
+sets nothing is unchanged) or `--target` on `make`. `print3d targets` lists them and
+says whether each slicer was found.
+
+**Bambu Lab X2D** — 0.4 mm nozzle, 256 × 256 × 260 mm bed, 0.20 mm layers, Bambu
+PLA Basic, textured PEI plate, sliced by Bambu Studio from this package's pinned
+profiles. Two nozzles: two colours print without a filament change.
+
+**Elegoo Centauri Carbon 2** — 0.4 mm single nozzle (350 °C hardened steel),
+256 × 256 × 256 mm bed, 0.20 mm layers, sliced by ElegooSlicer from the slicer's own
+installed profiles. `--material` picks any of the 30 CC2 presets (PLA Basic is the
+default; also PLA Matte, Silk, Galaxy, PETG, ABS, ASA, PC, PAHT-CF, TPU and more).
+Plates are `Default Plate`, `Cool Plate`, `Engineering Plate`, `High Temp Plate`,
+`Textured PEI Plate` (its own default), `Textured Cool Plate`, `Supertack Plate`.
+`--plate smooth` means the smooth side of the reversible PEI sheet: same plate, same
+bed temperature, so it resolves to `Textured PEI Plate`.
+
+**The pinned process has supports off on both machines** — that is why an overhang
+note is a real defect and not a setting to flip.
+
+On the CC2 a multi-colour job is refused with an error rather than promised: 
+ElegooSlicer's CLI assigns one filament per slice (verified on 1.5.3.5), so two
+colours have to be sliced in the GUI for now. Nothing is ever sent to a printer —
+the hand-off is the project `.3mf` to open in ElegooSlicer.
